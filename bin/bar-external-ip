@@ -1,0 +1,615 @@
+#!/bin/bash
+#
+# bar-external-ip: public IPv4 address and connection details for the Omarchy bar.
+#
+# Backend of the lws.external-ip Omarchy shell plugin
+# (~/.config/omarchy/plugins/lws.external-ip/bin/bar-external-ip). The
+# plugin's service runs `fetch` every 60 seconds and shortly after any IPv4
+# route or rule change, and draws the JSON this prints. All lookup,
+# validation and caching lives here, so everything the widget shows can be
+# reproduced from a terminal.
+# Documentation: https://github.com/Linear-Web-Solutions/omarchy-external-ip
+# License: MIT
+#
+# Privacy and safety:
+#   - Only fixed HTTPS endpoints are contacted, over IPv4, with a bare GET.
+#     Nothing about this machine is sent to them.
+#   - A response is read up to 64 bytes and must be a single public
+#     dotted-quad IPv4 address; anything else is discarded. Nothing returned
+#     is evaluated, sourced or passed to a shell.
+#   - Local addresses, interfaces and gateways come from `ip` and `nmcli` and
+#     only ever appear in this script's local output.
+#   - State lives in $XDG_RUNTIME_DIR/bar-external-ip (tmpfs, mode 0700) and
+#     is replaced atomically; a lock keeps concurrent lookups from overlapping.
+
+set -uo pipefail
+umask 077
+
+readonly PLUGIN_ID="lws.external-ip"
+readonly DEFAULT_ENDPOINTS="https://api.ipify.org https://icanhazip.com https://checkip.amazonaws.com"
+readonly CONNECT_TIMEOUT=3
+readonly REQUEST_TIMEOUT=5
+readonly MAX_RESPONSE_BYTES=64
+# Scheduled lookups closer together than this reuse the cached result.
+# Manual and network-change refreshes pass --force and always look up; the
+# plugin service runs one lookup at a time and coalesces repeated requests.
+readonly AUTO_MIN_INTERVAL=10
+# Longer than the worst case of every endpoint timing out (3 x 5 s).
+readonly LOCK_WAIT=25
+# Only used for a local routing-table lookup (`ip route get`); no packet is sent.
+readonly ROUTE_PROBE="1.1.1.1"
+
+readonly ICON_ONLINE=$'\U000F059F'  # nf-md-web
+readonly ICON_OFFLINE=$'\U000F0A8E' # nf-md-web_off
+readonly ICON_COPY=$'\U000F018F'    # nf-md-content_copy
+
+if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]]; then
+  STATE_DIR="$XDG_RUNTIME_DIR/bar-external-ip"
+else
+  STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bar-external-ip"
+fi
+readonly STATE_DIR
+readonly STATE_FILE="$STATE_DIR/state.json"
+readonly LOCK_FILE="$STATE_DIR/fetch.lock"
+
+usage() {
+  cat <<'USAGE'
+Usage: bar-external-ip [command]
+
+Public IPv4 address for the Omarchy bar widget lws.external-ip.
+
+Commands:
+  fetch [--force]  Look up the public IPv4 address, update the cache and print
+                   status JSON. Without --force a lookup within 10 seconds of
+                   the previous one reuses its result.
+  status           Print status JSON from the cache and local network state.
+                   Makes no network requests. (default)
+  get              Print the cached public IPv4 address; exit 1 if there is none.
+  copy             Copy the cached address to the clipboard and show a notification.
+  refresh          Ask the running bar widget to look the address up now.
+  help             Show this help.
+
+Environment:
+  BAR_EXTERNAL_IP_ENDPOINTS  Space-separated https:// URLs to try in order
+                             instead of the defaults (api.ipify.org,
+                             icanhazip.com, checkip.amazonaws.com).
+
+State: $XDG_RUNTIME_DIR/bar-external-ip/state.json
+USAGE
+}
+
+die_usage() {
+  echo "bar-external-ip: $1" >&2
+  echo "Run 'bar-external-ip help' for usage." >&2
+  exit 2
+}
+
+now_epoch() { printf '%(%s)T' -1; }
+
+clock_time() {
+  local ts=$1 today day
+  printf -v today '%(%Y%m%d)T' -1
+  printf -v day '%(%Y%m%d)T' "$ts"
+  if [[ $day == "$today" ]]; then
+    printf '%(%H:%M:%S)T' "$ts"
+  else
+    printf '%(%b %-d %H:%M)T' "$ts"
+  fi
+}
+
+ensure_state_dir() {
+  if [[ -L $STATE_DIR ]]; then
+    echo "bar-external-ip: refusing to use symlinked state directory $STATE_DIR" >&2
+    return 1
+  fi
+  mkdir -p -m 700 -- "$STATE_DIR" 2>/dev/null
+  if [[ ! -d $STATE_DIR || ! -O $STATE_DIR ]]; then
+    echo "bar-external-ip: state directory $STATE_DIR is not usable" >&2
+    return 1
+  fi
+  chmod 700 -- "$STATE_DIR" 2>/dev/null
+  return 0
+}
+
+# A public, globally routable dotted quad in canonical form (no leading zeros,
+# no surrounding text). Private, shared, loopback, link-local, documentation,
+# benchmarking, multicast and reserved ranges can never be what a server on
+# the internet saw, so a response naming one is treated as malformed.
+valid_public_ipv4() {
+  valid_local_ipv4 "$1" || return 1
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+  [[ $1 =~ ^$octet\.$octet\.$octet\.$octet$ ]] || return 1
+  local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]}
+  ((a == 0 || a == 10 || a == 127 || a >= 224)) && return 1
+  ((a == 100 && b >= 64 && b <= 127)) && return 1
+  ((a == 169 && b == 254)) && return 1
+  ((a == 172 && b >= 16 && b <= 31)) && return 1
+  ((a == 192 && b == 168)) && return 1
+  ((a == 192 && b == 0 && (c == 0 || c == 2))) && return 1
+  ((a == 198 && (b == 18 || b == 19))) && return 1
+  ((a == 198 && b == 51 && c == 100)) && return 1
+  ((a == 203 && b == 0 && c == 113)) && return 1
+  return 0
+}
+
+valid_ifname() { [[ $1 =~ ^[A-Za-z0-9._@:-]{1,15}$ ]]; }
+
+# Any canonical dotted quad. The explicit character list comes first because
+# bracket ranges like [0-9] follow the locale's collation and can match
+# non-ASCII digits such as U+FF11 in a UTF-8 locale.
+valid_local_ipv4() {
+  [[ -n $1 && $1 != *[!0123456789.]* ]] || return 1
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+  [[ $1 =~ ^$octet\.$octet\.$octet\.$octet$ ]]
+}
+
+endpoint_host() {
+  local host=${1#https://}
+  host=${host%%/*}
+  printf '%s' "${host%%:*}"
+}
+
+load_endpoints() {
+  ENDPOINTS=()
+  local candidates url
+  read -r -a candidates <<<"${BAR_EXTERNAL_IP_ENDPOINTS:-$DEFAULT_ENDPOINTS}"
+  for url in "${candidates[@]}"; do
+    if [[ $url =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+      ENDPOINTS+=("$url")
+    else
+      echo "bar-external-ip: ignoring endpoint that is not a plain https:// URL: $url" >&2
+    fi
+  done
+  if ((${#ENDPOINTS[@]} == 0)); then
+    read -r -a ENDPOINTS <<<"$DEFAULT_ENDPOINTS"
+  fi
+}
+
+# ---------------------------------------------------------------- state
+
+load_state() {
+  CACHED_IP="" UPDATED_AT=0 CHECKED_AT=0 FAILED_SINCE=0 SOURCE=""
+  [[ -f $STATE_FILE && ! -L $STATE_FILE ]] || return 0
+
+  local fields=()
+  mapfile -t fields < <(jq -r '
+    [.ip, .updatedAt, .checkedAt, .failedSince, .source][]
+    | tostring | gsub("[^0-9A-Za-z.-]"; "")' "$STATE_FILE" 2>/dev/null)
+  ((${#fields[@]} == 5)) || return 0
+
+  valid_public_ipv4 "${fields[0]}" && CACHED_IP=${fields[0]}
+  [[ ${fields[1]} =~ ^[0-9]{1,12}$ ]] && UPDATED_AT=${fields[1]}
+  [[ ${fields[2]} =~ ^[0-9]{1,12}$ ]] && CHECKED_AT=${fields[2]}
+  [[ ${fields[3]} =~ ^[0-9]{1,12}$ ]] && FAILED_SINCE=${fields[3]}
+  [[ ${fields[4]} =~ ^[A-Za-z0-9.-]{1,253}$ ]] && SOURCE=${fields[4]}
+  [[ -n $CACHED_IP ]] || UPDATED_AT=0
+  return 0
+}
+
+save_state() {
+  local tmp
+  tmp=$(mktemp -- "$STATE_DIR/.state.XXXXXX") || return 1
+  if jq -n \
+    --arg ip "$CACHED_IP" \
+    --arg source "$SOURCE" \
+    --argjson updatedAt "$UPDATED_AT" \
+    --argjson checkedAt "$CHECKED_AT" \
+    --argjson failedSince "$FAILED_SINCE" \
+    '{ip: $ip, source: $source, updatedAt: $updatedAt, checkedAt: $checkedAt, failedSince: $failedSince}' \
+    >"$tmp" && mv -f -- "$tmp" "$STATE_FILE"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+# -------------------------------------------------------- local network
+
+# Value following `key` in a one-line `ip` route description.
+route_field() {
+  local key=$1 words i
+  read -r -a words <<<"$2"
+  for ((i = 0; i < ${#words[@]} - 1; i++)); do
+    if [[ ${words[i]} == "$key" ]]; then
+      printf '%s' "${words[i + 1]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+kind_label() {
+  case $1 in
+    wireguard) echo "WireGuard" ;;
+    tun) echo "TUN" ;;
+    tap) echo "TAP" ;;
+    ppp) echo "PPP" ;;
+    ovpn | ovpn-dco) echo "OpenVPN" ;;
+    vti | vti6 | xfrm) echo "IPsec" ;;
+    *) echo "IP tunnel" ;;
+  esac
+}
+
+# Name of the NetworkManager connection active on a device, if any.
+nm_connection_name() {
+  local want=$1 line name type device
+  command -v nmcli >/dev/null 2>&1 || return 1
+  while IFS= read -r line; do
+    # Terse output escapes ':' and '\' inside values with a backslash.
+    line=${line//\\\\/$'\x1e'}
+    line=${line//\\:/$'\x1f'}
+    IFS=: read -r name type device <<<"$line"
+    device=${device//$'\x1f'/:}
+    device=${device//$'\x1e'/\\}
+    [[ $device == "$want" ]] || continue
+    name=${name//$'\x1f'/:}
+    name=${name//$'\x1e'/\\}
+    name=${name//[[:cntrl:]]/}
+    printf '%s' "${name:0:48}"
+    return 0
+  done < <(timeout 2 nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null)
+  return 1
+}
+
+first_ipv4_on() {
+  local line words addr
+  while IFS= read -r line; do
+    read -r -a words <<<"$line"
+    addr=${words[3]:-}
+    addr=${addr%%/*}
+    if valid_local_ipv4 "$addr"; then
+      printf '%s' "$addr"
+      return 0
+    fi
+  done < <(ip -4 -o addr show dev "$1" scope global 2>/dev/null)
+  return 1
+}
+
+collect_network() {
+  NET_ONLINE=false
+  EGRESS_DEV="" EGRESS_SRC="" EGRESS_VIA=""
+  PHYS_DEV="" PHYS_GW="" PHYS_SRC="" PHYS_TYPE=""
+  VPN_ACTIVE=false VPN_DEV="" VPN_KIND="" VPN_NAME="" VPN_ADDR=""
+  OTHER_TUNNELS=()
+
+  # Tunnel-type links that are up, from `ip -d -o link`: the kind is the first
+  # word of the third backslash-separated segment (ppp shows in the second).
+  local -A tunnel_kind=()
+  local line segments name kind word
+  while IFS= read -r line; do
+    IFS='\' read -r -a segments <<<"$line"
+    read -r _ name _ <<<"${segments[0]:-}"
+    name=${name%:}
+    name=${name%%@*}
+    valid_ifname "$name" || continue
+    kind=""
+    [[ ${segments[1]:-} == *link/ppp* ]] && kind=ppp
+    read -r word _ <<<"${segments[2]:-}"
+    case $word in
+      wireguard | ipip | gre | gretap | sit | ip6tnl | ip6gre | vti | vti6 | xfrm | ovpn | ovpn-dco) kind=$word ;;
+      tun) [[ ${segments[2]} == *"type tap"* ]] && kind=tap || kind=tun ;;
+    esac
+    [[ -n $kind ]] && tunnel_kind[$name]=$kind
+  done < <(ip -d -o link show up 2>/dev/null)
+
+  local route
+  if route=$(ip -4 -o route get "$ROUTE_PROBE" 2>/dev/null) && [[ -n $route ]]; then
+    EGRESS_DEV=$(route_field dev "$route")
+    EGRESS_SRC=$(route_field src "$route")
+    EGRESS_VIA=$(route_field via "$route")
+    valid_ifname "$EGRESS_DEV" && NET_ONLINE=true || EGRESS_DEV=""
+  fi
+
+  # The physical uplink: the main table's best default route that is not a tunnel.
+  local best=-1 dev metric
+  while IFS= read -r line; do
+    dev=$(route_field dev "$line") || continue
+    valid_ifname "$dev" || continue
+    [[ -n ${tunnel_kind[$dev]:-} ]] && continue
+    metric=$(route_field metric "$line") || metric=0
+    [[ $metric =~ ^[0-9]+$ ]] || metric=0
+    if ((best < 0 || metric < best)); then
+      best=$metric
+      PHYS_DEV=$dev
+      PHYS_GW=$(route_field via "$line")
+      PHYS_SRC=$(route_field src "$line")
+    fi
+  done < <(ip -4 -o route show default table main 2>/dev/null)
+
+  if [[ -z $PHYS_DEV && -n $EGRESS_DEV && -z ${tunnel_kind[$EGRESS_DEV]:-} ]]; then
+    PHYS_DEV=$EGRESS_DEV PHYS_GW=$EGRESS_VIA PHYS_SRC=$EGRESS_SRC
+  fi
+  if [[ -n $PHYS_DEV ]]; then
+    valid_local_ipv4 "$PHYS_SRC" || PHYS_SRC=$(first_ipv4_on "$PHYS_DEV")
+    valid_local_ipv4 "$PHYS_GW" || PHYS_GW=""
+    if [[ -d /sys/class/net/$PHYS_DEV/wireless || -e /sys/class/net/$PHYS_DEV/phy80211 ]]; then
+      PHYS_TYPE="Wi-Fi"
+    elif [[ $(cat "/sys/class/net/$PHYS_DEV/type" 2>/dev/null) == 1 ]]; then
+      PHYS_TYPE="Ethernet"
+    fi
+  fi
+
+  if [[ -n $EGRESS_DEV && -n ${tunnel_kind[$EGRESS_DEV]:-} ]]; then
+    VPN_ACTIVE=true
+    VPN_DEV=$EGRESS_DEV
+    VPN_KIND=$(kind_label "${tunnel_kind[$EGRESS_DEV]}")
+    VPN_ADDR=$EGRESS_SRC
+    valid_local_ipv4 "$VPN_ADDR" || VPN_ADDR=$(first_ipv4_on "$VPN_DEV")
+    VPN_NAME=$(nm_connection_name "$VPN_DEV") || VPN_NAME=""
+    [[ $VPN_NAME == "$VPN_DEV" ]] && VPN_NAME=""
+  fi
+
+  for name in "${!tunnel_kind[@]}"; do
+    [[ $name == "$VPN_DEV" ]] || OTHER_TUNNELS+=("$name")
+  done
+  if ((${#OTHER_TUNNELS[@]} > 1)); then
+    mapfile -t OTHER_TUNNELS < <(printf '%s\n' "${OTHER_TUNNELS[@]}" | sort)
+  fi
+}
+
+# --------------------------------------------------------------- lookup
+
+lookup_public_ip() {
+  FOUND_IP="" FOUND_SOURCE=""
+  local url body candidate
+  for url in "${ENDPOINTS[@]}"; do
+    # -q: ignore ~/.curlrc so behaviour is fixed. No redirects are followed.
+    body=$(curl -q -4 --silent --fail \
+      --proto '=https' --tlsv1.2 \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" \
+      --max-filesize "$MAX_RESPONSE_BYTES" \
+      -H 'Accept: text/plain' \
+      -- "$url" 2>/dev/null | head -c "$MAX_RESPONSE_BYTES") || continue
+    [[ $body =~ ^[[:space:]]*([0-9.]{7,15})[[:space:]]*$ ]] || continue
+    candidate=${BASH_REMATCH[1]}
+    if valid_public_ipv4 "$candidate"; then
+      FOUND_IP=$candidate
+      FOUND_SOURCE=$(endpoint_host "$url")
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --------------------------------------------------------------- output
+
+print_status() {
+  local state label icon klass
+  if [[ -n $CACHED_IP ]]; then
+    label=$CACHED_IP
+    icon=$ICON_ONLINE
+    if ((FAILED_SINCE > 0)); then state=stale; else state=ok; fi
+  elif ((CHECKED_AT > 0)); then
+    state=offline label="Offline" icon=$ICON_OFFLINE
+  else
+    state=pending label="" icon=$ICON_ONLINE
+  fi
+  case $state in
+    stale | offline) klass="$state" ;;
+    *) klass="" ;;
+  esac
+
+  local lines=()
+  case $state in
+    ok) lines+=("Public IPv4 $CACHED_IP") ;;
+    stale) lines+=("Public IPv4 $CACHED_IP (last known)") ;;
+    offline) lines+=("Public IPv4 unavailable") ;;
+    pending) lines+=("Public IPv4 looking up…") ;;
+  esac
+
+  if [[ -n $PHYS_DEV ]]; then
+    lines+=("Local IPv4 ${PHYS_SRC:-none}")
+    lines+=("Interface $PHYS_DEV${PHYS_TYPE:+ ($PHYS_TYPE)}")
+    lines+=("Gateway ${PHYS_GW:-none}")
+  elif [[ $NET_ONLINE != true ]]; then
+    lines+=("No network connection")
+  fi
+
+  if [[ $VPN_ACTIVE == true ]]; then
+    local detail="$VPN_KIND on $VPN_DEV${VPN_ADDR:+, $VPN_ADDR}"
+    if [[ -n $VPN_NAME ]]; then
+      lines+=("VPN $VPN_NAME ($detail)")
+    else
+      lines+=("VPN $detail")
+    fi
+  elif ((${#OTHER_TUNNELS[@]} > 0)); then
+    local joined
+    printf -v joined '%s, ' "${OTHER_TUNNELS[@]}"
+    lines+=("VPN not routing internet traffic (${joined%, } up)")
+  else
+    lines+=("VPN off")
+  fi
+
+  if ((UPDATED_AT > 0)); then
+    lines+=("Last refresh $(clock_time "$UPDATED_AT")${SOURCE:+ via $SOURCE}")
+  fi
+  if ((FAILED_SINCE > 0)); then
+    if [[ $NET_ONLINE == true ]]; then
+      lines+=("Lookups failing since $(clock_time "$FAILED_SINCE")")
+    else
+      lines+=("Offline since $(clock_time "$FAILED_SINCE")")
+    fi
+  fi
+  lines+=("" "Click to copy · Right-click to refresh")
+
+  local tooltip
+  printf -v tooltip '%s\n' "${lines[@]}"
+  tooltip=${tooltip%$'\n'}
+
+  local tunnels_json="[]"
+  if ((${#OTHER_TUNNELS[@]} > 0)); then
+    tunnels_json=$(printf '%s\n' "${OTHER_TUNNELS[@]}" | jq -R . | jq -cs .)
+  fi
+
+  jq -cn \
+    --arg state "$state" \
+    --arg ip "$CACHED_IP" \
+    --arg label "$label" \
+    --arg text "$icon${label:+ $label}" \
+    --arg tooltip "$tooltip" \
+    --arg class "$klass" \
+    --arg source "$SOURCE" \
+    --argjson updatedAt "$UPDATED_AT" \
+    --argjson checkedAt "$CHECKED_AT" \
+    --argjson failedSince "$FAILED_SINCE" \
+    --argjson online "$NET_ONLINE" \
+    --arg localAddress "$PHYS_SRC" \
+    --arg localInterface "$PHYS_DEV" \
+    --arg localType "$PHYS_TYPE" \
+    --arg gateway "$PHYS_GW" \
+    --argjson vpnActive "$VPN_ACTIVE" \
+    --arg vpnInterface "$VPN_DEV" \
+    --arg vpnKind "$VPN_KIND" \
+    --arg vpnName "$VPN_NAME" \
+    --arg vpnAddress "$VPN_ADDR" \
+    --argjson tunnels "$tunnels_json" \
+    '{
+      state: $state, ip: $ip, label: $label,
+      text: $text, tooltip: $tooltip, class: $class, alt: $state,
+      source: $source, updatedAt: $updatedAt, checkedAt: $checkedAt, failedSince: $failedSince,
+      online: $online,
+      local: {address: $localAddress, interface: $localInterface, type: $localType, gateway: $gateway},
+      vpn: {active: $vpnActive, interface: $vpnInterface, kind: $vpnKind, name: $vpnName, address: $vpnAddress},
+      otherTunnels: $tunnels
+    }'
+}
+
+signal_bar() {
+  command -v omarchy-shell >/dev/null 2>&1 || return 1
+  [[ -n ${OMARCHY_PATH:-} ]] || return 1
+  OMARCHY_SHELL_IPC_TIMEOUT=2s timeout 5 omarchy-shell "$PLUGIN_ID" "$1" >/dev/null 2>&1
+}
+
+notify() {
+  local headline=$1 description=$2 glyph=$3 urgency=${4:-low}
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send --app-name "External IP" -g "$glyph" -u "$urgency" -t 2500 --transient \
+      "$headline" "$description" >/dev/null 2>&1 && return 0
+  fi
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a "External IP" -u "$urgency" -t 2500 -h int:transient:1 "$headline" "$description"
+}
+
+# ------------------------------------------------------------- commands
+
+cmd_fetch() {
+  local force=0 from_bar=0 arg
+  for arg in "$@"; do
+    case $arg in
+      --force) force=1 ;;
+      --from-bar) from_bar=1 ;;
+      *) die_usage "unknown fetch option: $arg" ;;
+    esac
+  done
+
+  load_endpoints
+  if ! ensure_state_dir; then
+    load_state
+    collect_network
+    print_status
+    return 1
+  fi
+
+  local lock_fd
+  if ! exec {lock_fd}>>"$LOCK_FILE"; then
+    echo "bar-external-ip: cannot open lock file $LOCK_FILE" >&2
+    return 1
+  fi
+  if ! flock -w "$LOCK_WAIT" "$lock_fd"; then
+    # Another lookup has held the lock for longer than any lookup can take;
+    # report what is cached rather than queueing behind it.
+    exec {lock_fd}>&-
+    load_state
+    collect_network
+    print_status
+    return 0
+  fi
+
+  load_state
+  collect_network
+
+  local now
+  now=$(now_epoch)
+  if ((!force && CHECKED_AT > 0 && now >= CHECKED_AT && now - CHECKED_AT < AUTO_MIN_INTERVAL)); then
+    exec {lock_fd}>&-
+    print_status
+    return 0
+  fi
+
+  if [[ $NET_ONLINE == true ]] && lookup_public_ip; then
+    CACHED_IP=$FOUND_IP
+    SOURCE=$FOUND_SOURCE
+    UPDATED_AT=$(now_epoch)
+    FAILED_SINCE=0
+  else
+    ((FAILED_SINCE > 0)) || FAILED_SINCE=$(now_epoch)
+  fi
+  CHECKED_AT=$(now_epoch)
+  save_state || echo "bar-external-ip: could not write $STATE_FILE" >&2
+  exec {lock_fd}>&-
+
+  print_status
+  ((from_bar)) || signal_bar reload
+  return 0
+}
+
+cmd_status() {
+  (($# == 0)) || die_usage "status takes no options"
+  load_state
+  collect_network
+  print_status
+}
+
+cmd_get() {
+  (($# == 0)) || die_usage "get takes no options"
+  load_state
+  [[ -n $CACHED_IP ]] || return 1
+  printf '%s\n' "$CACHED_IP"
+}
+
+cmd_copy() {
+  (($# == 0)) || die_usage "copy takes no options"
+  load_state
+  if [[ -z $CACHED_IP ]]; then
+    notify "No public IP to copy" "The address has not been found yet. Right-click the widget to retry." "$ICON_OFFLINE" normal
+    return 1
+  fi
+  if ! command -v wl-copy >/dev/null 2>&1 || ! printf '%s' "$CACHED_IP" | wl-copy 2>/dev/null; then
+    notify "Could not copy public IP" "wl-copy is unavailable or failed." "$ICON_OFFLINE" normal
+    return 1
+  fi
+  if ((FAILED_SINCE > 0)); then
+    notify "Public IP copied" "$CACHED_IP (last known, lookups are failing)" "$ICON_COPY"
+  else
+    notify "Public IP copied" "$CACHED_IP" "$ICON_COPY"
+  fi
+}
+
+cmd_refresh() {
+  (($# == 0)) || die_usage "refresh takes no options"
+  if signal_bar refresh; then
+    echo "Asked the bar widget to refresh."
+  else
+    echo "Bar widget not reachable; looking up directly." >&2
+    cmd_fetch --force
+  fi
+}
+
+main() {
+  local command=${1:-status}
+  (($# > 0)) && shift
+  case $command in
+    fetch) cmd_fetch "$@" ;;
+    status) cmd_status "$@" ;;
+    get) cmd_get "$@" ;;
+    copy) cmd_copy "$@" ;;
+    refresh) cmd_refresh "$@" ;;
+    help | -h | --help) usage ;;
+    *) die_usage "unknown command: $command" ;;
+  esac
+}
+
+# Run only when executed, so tests/run.sh can source the functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

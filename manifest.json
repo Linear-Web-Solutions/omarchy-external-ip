@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "lws.external-ip",
+  "name": "External IP",
+  "version": "1.0.0",
+  "author": "Linear Web Solutions",
+  "license": "MIT",
+  "description": "Public IPv4 address with connection details; click to copy, right-click to refresh",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "External IP",
+    "description": "Public IPv4 address with connection details; click to copy, right-click to refresh",
+    "category": "Network",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
