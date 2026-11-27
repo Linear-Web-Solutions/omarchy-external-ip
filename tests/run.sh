@@ -63,7 +63,7 @@ fi
 # Source the helper's functions with an isolated state directory.
 export XDG_RUNTIME_DIR=$WORK/runtime
 unset BAR_EXTERNAL_IP_ENDPOINTS
-# shellcheck source=../bin/bar-external-ip
+# shellcheck source=bin/bar-external-ip
 source "$HELPER"
 
 # --------------------------------------------------- address validation
@@ -198,6 +198,38 @@ if route_field metric "$route" >/dev/null; then bad "route_field should fail on 
 for pair in wireguard:WireGuard tun:TUN ovpn-dco:OpenVPN xfrm:IPsec gre:"IP tunnel"; do
   if [[ $(kind_label "${pair%%:*}") == "${pair#*:}" ]]; then ok; else bad "kind_label ${pair%%:*}"; fi
 done
+
+section "tunnel and uplink detection (stubbed ip)"
+# Canned `ip` output in the real one-line formats: ethernet uplink, a
+# WireGuard tunnel carrying the default route through its own table, and two
+# idle tunnels (TAP and PPP).
+ip() {
+  case "$*" in
+    "-d -o link show up")
+      printf '%s\n' \
+        '2: eth9: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\    link/ether 00:00:5e:00:53:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 \    addrgenmode none' \
+        '7: wg9: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none  promiscuity 0 \    wireguard addrgenmode none' \
+        '8: tap9: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\    link/ether 00:00:5e:00:53:02 brd ff:ff:ff:ff:ff:ff promiscuity 0 \    tun type tap pi off vnet_hdr off persist off addrgenmode random' \
+        '9: ppp9: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1492 qdisc fq_codel state UNKNOWN\    link/ppp  promiscuity 0 \    addrgenmode random'
+      ;;
+    "-4 -o route get 1.1.1.1") printf '%s\n' '1.1.1.1 dev wg9 table 51820 src 10.2.0.2 uid 1000 \    cache' ;;
+    "-4 -o route show default table main") printf '%s\n' 'default via 192.168.1.1 dev eth9 proto dhcp src 192.168.1.20 metric 100' ;;
+    *) return 1 ;;
+  esac
+}
+collect_network
+unset -f ip
+if [[ $NET_ONLINE == true && $VPN_ACTIVE == true && $VPN_DEV == wg9 && $VPN_KIND == WireGuard && $VPN_ADDR == 10.2.0.2 ]]; then
+  ok
+else
+  bad "VPN detection: active=$VPN_ACTIVE dev=$VPN_DEV kind=$VPN_KIND addr=$VPN_ADDR"
+fi
+if [[ $PHYS_DEV == eth9 && $PHYS_GW == 192.168.1.1 && $PHYS_SRC == 192.168.1.20 ]]; then
+  ok
+else
+  bad "uplink detection: dev=$PHYS_DEV gw=$PHYS_GW src=$PHYS_SRC"
+fi
+if [[ ${OTHER_TUNNELS[*]} == "ppp9 tap9" ]]; then ok; else bad "idle tunnels: ${OTHER_TUNNELS[*]}"; fi
 
 # ------------------------------------------------------------- output
 section "status JSON"

@@ -18,6 +18,7 @@ the no-route case runs inside an unprivileged network namespace
 | Endpoints | Only plain `https://` URLs accepted from the override. Falls back to the defaults. Default order. |
 | Lookup | Falls past failing, HTML, private-range, multi-line, oversized and shell-syntax responses to the first valid one, and stops there. Response content is never executed. curl is called with `-q -4 --fail --proto =https --tlsv1.2`, the timeouts and the size limit, without redirects. |
 | State | Modes 0700/0600. Round trip. Tampered, malformed and symlinked state files are ignored or sanitised. |
+| Network detection | From canned `ip` output: a WireGuard tunnel carrying traffic through its own routing table is reported as the VPN, the ethernet uplink and gateway are found under it, and idle TAP and PPP tunnels are listed. |
 | Status JSON | Valid JSON for ok, stale, offline and pending. Hostile strings (quotes, backslashes, markup, newlines) survive escaping exactly. Tooltip lines. |
 | No route | `fetch` reports offline without calling curl and records the failed check. |
 | Command line | Help, exit codes for bad commands and options, `get` with no cache. |

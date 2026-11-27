@@ -1,11 +1,13 @@
 # External IP for Omarchy
 
+[![tests](https://github.com/Linear-Web-Solutions/omarchy-external-ip/actions/workflows/tests.yml/badge.svg)](https://github.com/Linear-Web-Solutions/omarchy-external-ip/actions/workflows/tests.yml)
+
 A bar widget for the [Omarchy](https://omarchy.org/) shell that shows your
 public IPv4 address, next to the network icon:
 
-```
-󰖟 203.0.113.42
-```
+![The widget at the right end of the Omarchy bar, showing a globe icon and an example address](docs/screenshot.png)
+
+<sub>Example address shown. Colours and font follow your theme.</sub>
 
 Hover for connection details, click to copy, right-click to look it up again.
 When a VPN is up it shows the VPN's exit address, because it follows the route
@@ -345,7 +347,8 @@ qs log -p "$OMARCHY_PATH/shell" | grep -i external-ip
 ├── BarWidget.qml          the bar widget
 ├── bin/bar-external-ip    helper: lookup, validation, cache, JSON, copy
 ├── tests/run.sh           offline test suite
-└── docs/TESTING.md        how to test by hand without touching your connection
+├── docs/TESTING.md        how to test by hand without touching your connection
+└── .github/workflows/     CI: ShellCheck and tests/run.sh on every push and pull request
 ```
 
 Work on a checkout in `~/.config/omarchy/plugins/lws.external-ip`. Saving a

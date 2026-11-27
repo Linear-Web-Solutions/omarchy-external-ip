@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          command -v jq >/dev/null && command -v shellcheck >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq jq shellcheck
+          }
+
+      - name: Manifest is valid JSON
+        run: jq empty manifest.json
+
+      - name: ShellCheck
+        run: shellcheck -x -S warning bin/bar-external-ip tests/run.sh
+
+      - name: Offline test suite
+        run: tests/run.sh

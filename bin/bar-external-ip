@@ -102,7 +102,9 @@ ensure_state_dir() {
     echo "bar-external-ip: refusing to use symlinked state directory $STATE_DIR" >&2
     return 1
   fi
-  mkdir -p -m 700 -- "$STATE_DIR" 2>/dev/null
+  # umask 077 makes any directory created here 0700; chmod below covers an
+  # existing one.
+  mkdir -p -- "$STATE_DIR" 2>/dev/null
   if [[ ! -d $STATE_DIR || ! -O $STATE_DIR ]]; then
     echo "bar-external-ip: state directory $STATE_DIR is not usable" >&2
     return 1
@@ -232,13 +234,13 @@ kind_label() {
 
 # Name of the NetworkManager connection active on a device, if any.
 nm_connection_name() {
-  local want=$1 line name type device
+  local want=$1 line name device
   command -v nmcli >/dev/null 2>&1 || return 1
   while IFS= read -r line; do
     # Terse output escapes ':' and '\' inside values with a backslash.
     line=${line//\\\\/$'\x1e'}
     line=${line//\\:/$'\x1f'}
-    IFS=: read -r name type device <<<"$line"
+    IFS=: read -r name _ device <<<"$line"
     device=${device//$'\x1f'/:}
     device=${device//$'\x1e'/\\}
     [[ $device == "$want" ]] || continue
@@ -277,7 +279,7 @@ collect_network() {
   local -A tunnel_kind=()
   local line segments name kind word
   while IFS= read -r line; do
-    IFS='\' read -r -a segments <<<"$line"
+    IFS=$'\x1f' read -r -a segments <<<"${line//\\/$'\x1f'}"
     read -r _ name _ <<<"${segments[0]:-}"
     name=${name%:}
     name=${name%%@*}
